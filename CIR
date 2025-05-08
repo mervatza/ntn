@@ -92,4 +92,25 @@ plt.ylabel("Delay [ns]")
 plt.colorbar(label="Magnitude [dB]")
 plt.tight_layout()
 plt.show()
+# === Plot multiple CIRs in a grid layout ===
+num_plots = len(cir_all)
+cols = numUsers
+rows = numDrones
+fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3 * rows), sharex=True, sharey=True)
+
+for idx, entry in enumerate(cir_all):
+    r = entry['drone']
+    c = entry['user']
+    ax = axes[r, c] if rows > 1 else axes[c]
+    im = ax.imshow(20 * np.log10(np.abs(entry['cir']) + 1e-8), aspect='auto',
+                   extent=[t_fade[0], t_fade[-1], delays_ns[-1], delays_ns[0]])
+    ax.set_title(f"D{r} → U{c}\nPL={entry['pathloss_dB']:.1f} dB, K={entry['K_dB']:.1f} dB")
+    if r == rows - 1:
+        ax.set_xlabel("Time [s]")
+    if c == 0:
+        ax.set_ylabel("Delay [ns]")
+
+fig.colorbar(im, ax=axes.ravel().tolist(), label="Magnitude [dB]")
+plt.tight_layout()
+plt.show()
 
