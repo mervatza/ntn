@@ -1,0 +1,200 @@
+# multi_uav_offload_with_detailed_channel.py
+#
+# Parameter-Block (Lines 1–10) defines all physical and traffic parameters.
+# Scenario Loop (Lines 22–33) over altitudes and speeds generates scenario_id.
+# Channel models:
+#   pathloss_38_811_a2g: TR 38.811 A2G with LoS/NLoS mixture and log-normal shadowing.
+#   rician_doppler_gain: Doppler-dependent Rician fading via AR(1)/J0 model.
+# Base energy computation E_base for alpha=1 in energy_base.csv.
+# Offload candidates: list all alpha vectors with sum(alpha)<=1 and compute total energy
+#   sum_{m,t} E_{m,t}(alpha_m) into offload_candidates.csv.
+# This captures all offload options across UAVs, altitudes, and speeds with full
+# channel modeling (3GPP 38.811, shadowing, elevation, Doppler due to UAV speed).
+# =============================================================================
+# energy_base.csv: Basis-Sendeenergie für α=1 je (Szenario, UAV, Slot)
+
+# offload_candidates.csv: Alle Off-load-Vektoren  mit ∑α≤1 und die zugehörige Gesamtenergie
+
+import numpy as np
+import pandas as pd
+from itertools import product
+from math import atan2, degrees, sqrt, log
+import matplotlib.pyplot as plt
+# -----------------------------------------------------------------------------
+# 1) System- & Traffic-Parameter
+# -----------------------------------------------------------------------------
+B        = 20e6               # Bandwidth [Hz]
+fc       = 2e9                # Carrier freq [Hz]
+c        = 3e8                # Speed of light [m/s]
+N0       = 10**((-174 - 30)/10)  # Noise PSD [W/Hz]
+G        = 10**(20/10)        # Antenna gain (linear)
+
+D_bits   = 28_000             # bits per slot per UAV
+T_slot   = 0.01               # slot duration [s]
+r        = D_bits/(B*T_slot)  # spectral load (b/Hz)
+
+# -----------------------------------------------------------------------------
+# 2) Scenario grid: altitude & speed
+# -----------------------------------------------------------------------------
+altitudes  = [50, 100, 150, 200, 300]   # UAV heights [m]
+speeds_kmh = [30, 60, 90, 120]          # UAV speeds [km/h]
+
+# -----------------------------------------------------------------------------
+# 3) Geometry & offload grid
+# -----------------------------------------------------------------------------
+area   = 1000                          # square area [m]
+bs_pos = np.array([area/2, area/2, 0]) # ground BS at center
+M      = 3                             # number of UAVs
+alphas = np.round(np.arange(0,1.0001,0.05),2)  # offload fractions
+
+# -----------------------------------------------------------------------------
+# 4) Detailed Channel Model: 3GPP 38.811 A2G + Rician Doppler
+# -----------------------------------------------------------------------------
+def pathloss_38_811_a2g(tx, rx):
+    d3    = np.linalg.norm(tx - rx)
+    d2    = np.linalg.norm(tx[:2] - rx[:2])
+    theta = degrees(atan2(tx[2] - rx[2], d2))
+    a, b  = 9.61, 0.16
+    PLoS  = 1/(1 + a*np.exp(-b*(theta - a)))
+    pl_l  = 28 + 22*np.log10(d3) + 20*np.log10(fc/1e9)
+    pl_n  = 13.54 + 39.08*np.log10(d3) + 20*np.log10(fc/1e9) - 0.6*(tx[2] - 1.5)
+    pl_dB = PLoS*pl_l + (1 - PLoS)*pl_n
+    # shadowing sigma=4 dB
+    pl_dB += np.random.randn() * 4
+    return 10**(pl_dB/10), theta
+
+def rician_doppler_gain(theta, speed_mps):
+    if   theta >= 70: Kdb = 10
+    elif theta >= 30: Kdb = 5
+    else:              Kdb = 0
+    K    = 10**(Kdb/10)
+    mu   = sqrt(K/(K+1))
+    sig  = sqrt(1/(2*(K+1)))
+    # Doppler coefficient approx with sinc
+    fD   = speed_mps * fc / c
+    rho  = np.sinc(2 * fD * T_slot)
+    h    = mu + sig*(np.random.randn() + 1j*np.random.randn())
+    noise= sig*(np.random.randn() + 1j*np.random.randn())
+    h2   = rho*h + sqrt(1 - rho**2)*noise
+    return abs(h2)**2
+
+# -----------------------------------------------------------------------------
+# 5) Compute base energy for each (scenario, UAV, slot)
+# -----------------------------------------------------------------------------
+rows = []
+scenario_id = 0
+
+for h in altitudes:
+    for v_kmh in speeds_kmh:
+        speed_mps = v_kmh * 1000/3600
+        t_flight  = area/speed_mps
+        n_slots   = int(np.ceil(t_flight/T_slot))
+
+        for m in range(M):
+            for t in range(n_slots):
+                x_t   = max(area - speed_mps*t*T_slot, 0.0)
+                uav_p = np.array([x_t, area/2, h])
+
+                PL_lin, theta = pathloss_38_811_a2g(uav_p, bs_pos)
+                g_val         = rician_doppler_gain(theta, speed_mps)
+
+                Kmt   = log(2) * PL_lin * N0 * B / (G * g_val)
+                Ebase = Kmt * (2**r - 1) * T_slot
+
+                rows.append({
+                    "scenario_id": scenario_id,
+                    "altitude_m":  h,
+                    "speed_kmh":   v_kmh,
+                    "uav_id":      m,
+                    "slot":        t,
+                    "E_base_J":    Ebase
+                })
+        scenario_id += 1
+
+df_base = pd.DataFrame(rows)
+df_base.to_csv("energy_base.csv", index=False)
+print("energy_base.csv erstellt mit", df_base.shape, "Zeilen")
+
+# -----------------------------------------------------------------------------
+# 6) Build offload candidates (Σα ≤ 1) and compute sum energy
+# -----------------------------------------------------------------------------
+alpha_combos = [vec for vec in product(alphas, repeat=M) if sum(vec) <= 1.0]
+cand_rows    = []
+
+for (sid, h, v_kmh), grp in df_base.groupby(["scenario_id","altitude_m","speed_kmh"]):
+    T    = grp.slot.max()+1
+    Emat = grp.pivot(index="uav_id", columns="slot", values="E_base_J").values
+    speed_mps = v_kmh * 1000/3600
+
+    for vec in alpha_combos:
+        fac   = (2**(np.array(vec)*r) - 1)/(2**r - 1)
+        E_sum = np.sum(Emat * fac[:,None])
+        entry = {
+            "scenario_id": sid,
+            "altitude_m":  h,
+            "speed_kmh":   v_kmh,
+            "E_sum_J":     E_sum
+        }
+        for m in range(M):
+            entry[f"alpha_{m}"] = vec[m]
+        cand_rows.append(entry)
+
+df_cand = pd.DataFrame(cand_rows)
+df_cand.to_csv("offload_candidates.csv", index=False)
+print("offload_candidates.csv erstellt mit", df_cand.shape, "Zeilen")
+
+ 
+print(df_cand.head())
+
+
+
+
+
+# === Extension 1: Plot Base-Energy vs. Speed for each UAV ===
+
+# Wir nutzen wieder df_base aus energy_base.csv
+# und aggregieren über altitude & slot je speed.
+
+for uav_id in range(M):
+    df_u = df_base[df_base["uav_id"] == uav_id]
+    avg_E_speed = (
+        df_u
+        .groupby("speed_kmh")["E_base_J"]
+        .mean()
+        .reset_index()
+        .sort_values("speed_kmh")
+    )
+
+    plt.figure(figsize=(6,4))
+    plt.plot(avg_E_speed["speed_kmh"], avg_E_speed["E_base_J"], marker="s")
+    plt.xlabel("Speed [km/h]")
+    plt.ylabel("Mean Base-Energy $E_{base}$ [J]")
+    plt.title(f"UAV {uav_id}: Mean Base-Energy vs. Speed")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+# Lese gerade geschriebene energy_base.csv
+df_base = pd.read_csv("energy_base.csv")
+
+# Für jeden UAV einzeln plotten
+for uav_id in range(M):
+    df_u = df_base[df_base["uav_id"] == uav_id]
+    # Mittel über speed & slot je altitude
+    avg_E = (
+        df_u
+        .groupby("altitude_m")["E_base_J"]
+        .mean()
+        .reset_index()
+        .sort_values("altitude_m")
+    )
+
+    plt.figure(figsize=(6,4))
+    plt.plot(avg_E["altitude_m"], avg_E["E_base_J"], marker="o")
+    plt.xlabel("Altitude [m]")
+    plt.ylabel("Mean Base-Energy $E_{base}$ [J]")
+    plt.title(f"UAV {uav_id}: Mean Base-Energy vs. Altitude")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
