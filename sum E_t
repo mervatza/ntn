@@ -198,3 +198,172 @@ for uav_id in range(M):
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+
+
+#######################################################################################
+#					includes total energy consumed by the UAV                         #
+#######################################################################################
+
+def air_density(h_m):
+    ρ0 = 1.225 # sea level
+    H = 8500 # scale height
+    return ρ0 * np.exp(-h_m / H)
+
+def propulsion_energy_rotary(W_kg, v_mps, h_m, t_sec, A=0.3, Cd=0.4, c1=1.0):
+    g = 9.81
+    W = W_kg * g
+    ρ = air_density(h_m)
+    P_hover = c1 *  pow(W,1.5) / np.sqrt(ρ) # (W1.5) / np.sqrt(ρ)
+    P_drag = 0.5 * Cd * A * ρ * v_mps3
+    return (P_hover + P_drag) * t_sec
+    
+    
+def generate_alpha_vectors(M, step=0.1, max_samples=1000):
+    """Generate valid α-vectors with sum(α) ≤ 1 using coarse grid + sampling."""
+    
+    grid = np.round(np.arange(0, 1.01, step), 2)
+    all_vecs = [vec for vec in product(grid, repeat=M) if sum(vec) <= 1.0]
+    
+    if len(all_vecs) > max_samples:
+        np.random.seed(42)
+        indices = np.random.choice(len(all_vecs), max_samples, replace=False)
+        return [all_vecs[i] for i in indices]
+        
+    return all_vecs
+    
+def generate_alpha_fixed_sum(M, alpha_sum, num_samples=20, seed=42):
+    """Generate random α-vectors with sum(α) ≈ alpha_sum and αᵢ ∈ [0,1]."""
+    
+    np.random.seed(seed)
+    vecs = []
+    for _ in range(num_samples):
+        base = np.random.rand(M)
+        scaled = base / np.sum(base) * alpha_sum
+        scaled = np.clip(scaled, 0, 1) # Ensure within [0,1]
+        
+    if np.sum(scaled) <= 1.0:
+        vecs.append(np.round(scaled, 4))
+        return vecs
+
+'''
+   We want to include the propulsion energy of the UAV
+'''
+
+def compute_total_energy_general(alpha_vec, C_list, kappa=1e-27, W_kg=5.0, A=0.3,
+                                   Cd=0.4, c1=1.0, altitude=150, speed_kmh=60, area=1000, T_slot=0.01
+                              ):
+                              
+    M = len(alpha_vec)
+    speed_mps = speed_kmh * 1000 / 3600
+    t_flight = area / speed_mps
+    n_slots = int(np.ceil(t_flight / T_slot))
+    
+  
+def plot_energy_surface_with_propulsion(M=2, kappa=1e-27, C_list=None,
+                                         W_kg=5.0, A=0.3, Cd=0.4, c1=1.0,
+                                         altitude=150, speed_kmh=60
+                                      ):   
+    M = len(alpha_vec)
+    speed_mps = speed_kmh * 1000 / 3600
+    t_flight = area / speed_mps
+    n_slots = int(np.ceil(t_flight / T_slot))                                  
+    
+    B = 20e6
+    fc = 2e9
+    c = 3e8
+    N0 = 10**((-174 - 30)/10)
+    G = 10**(20/10)
+    D_bits = 28000
+    r = D_bits / (B * T_slot)
+    bs_pos = np.array([area / 2, area / 2, 0])
+
+    total_energy = 0
+
+    for m in range(M):
+        C = C_list[m]
+        f = C / T_slot
+        E_cpu = kappa * C * f**2 * (1 - alpha_vec[m])
+        E_comm = 0
+
+        for t in range(n_slots):
+            x_t = max(area - speed_mps * t * T_slot, 0.0)
+            uav_p = np.array([x_t, area / 2, altitude])
+            PL_lin, theta = pathloss_38_811_a2g(uav_p, bs_pos)
+            g = rician_doppler_gain(theta, speed_mps)
+            Kmt = log(2) * PL_lin * N0 * B / (G * g)
+            E_base = Kmt * (2**r - 1) * T_slot
+            E_comm += alpha_vec[m] * E_base
+
+        total_energy += E_cpu + E_comm
+
+    # Add propulsion energy
+    total_energy += propulsion_energy_rotary(W_kg, speed_mps, altitude, t_flight, A, Cd, c1)
+    print("\n -> ", total_energy)
+    return total_energy
+
+
+def visualize_energy_vs_total_offload(M=10, step=0.1, num_alpha_samples=25, altitude=200,
+                                   speed_kmh=60, W_kg=6.0, A=0.3, Cd=0.4, c1=1.0,):
+                                   
+    alpha_totals = np.round(np.arange(0.2, 1.01, step), 2)
+    C_list = [1e9 + 1e8 * np.random.rand() for _ in range(M)]
+    avg_energy = []
+    
+    for α_sum in alpha_totals:
+        α_vecs = generate_alpha_fixed_sum(M, α_sum, num_samples=num_alpha_samples)
+        energies = []
+        for α in α_vecs:
+            E = compute_total_energy_general(
+                α,
+                C_list,
+                altitude=altitude,
+                speed_kmh=speed_kmh,
+                W_kg=W_kg,
+                A=A,
+                Cd=Cd,
+                c1=c1
+            )
+            energies.append(E)
+        avg_E = np.mean(energies)
+        avg_energy.append(avg_E)
+
+    # Plot
+    plt.figure(figsize=(7, 5))
+    plt.plot(alpha_totals, avg_energy, marker='o', color='royalblue')
+    plt.xlabel("Total Offloading Fraction ∑α (across M devices)")
+    plt.ylabel("Average Total Energy [J]")
+    plt.title(f"Energy vs Offloaded Load (M={M}, Alt={altitude} m, Speed={speed_kmh} km/h)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+
+def find_best_alpha_M_devices(M=12, step=0.1, max_samples=2000, altitude=150, speed_kmh=60 ):
+	
+    C_list = [1e9 + 1e8 * np.random.rand() for _ in range(M)] # heterogeneous tasks
+    alpha_candidates = generate_alpha_vectors(M, step=step, max_samples=max_samples)
+    
+    best_E = float('inf')
+    best_vec = None
+
+    for α in alpha_candidates:
+        E = compute_total_energy_general(α, C_list, altitude=altitude, speed_kmh=speed_kmh)
+        if E < best_E:
+            best_E = E
+            best_vec = α
+
+    print(f"✅ Optimal α (sum={sum(best_vec):.2f}):", np.round(best_vec, 2))
+    print(f"🔋 Minimum total energy: {best_E:.2f} J")
+    return best_vec, best_E
+    
+
+# ToDo:: Below is for a single altitude, we need to try this out for different altitudes and speeds
+
+find_best_alpha_M_devices(M=12, step=0.1, max_samples=1000, altitude=200, speed_kmh=90)
+
+visualize_energy_vs_total_offload(M=12, step=0.1, num_alpha_samples=20, altitude=200, speed_kmh=90 )
+
+#######################################################################################
+#					End - includes total energy consumed by the UAV                         #
+#######################################################################################
